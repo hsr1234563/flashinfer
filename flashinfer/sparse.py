@@ -37,6 +37,51 @@ from .utils import (
 )
 
 
+def _bsr_to_vsa_index(
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    MB: int,
+    NB: int,
+    num_heads: int,
+    device: torch.device,
+    non_blocking: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert BSR (indptr/indices) to VSA q2k_index / q2k_num tensors.
+
+    Returns
+    -------
+    q2k_index : torch.Tensor  shape ``[1, num_heads, MB, NB]``, dtype int32
+        For each (q_block), the list of attended KV-block indices, padded
+        with -1.  Same pattern is broadcast across all heads.
+    q2k_num : torch.Tensor  shape ``[1, num_heads, MB]``, dtype int32
+        Number of attended KV-blocks per Q-block.
+    """
+    indptr_cpu = indptr.cpu()
+    indices_cpu = indices.cpu().to(torch.int32)
+
+    q2k_index_flat = torch.full((MB, NB), -1, dtype=torch.int32)
+    q2k_num_flat = (indptr_cpu[1:] - indptr_cpu[:-1]).to(torch.int32)
+
+    for i in range(MB):
+        s = int(indptr_cpu[i].item())
+        e = int(indptr_cpu[i + 1].item())
+        if e > s:
+            q2k_index_flat[i, : e - s] = indices_cpu[s:e]
+
+    # Broadcast the same pattern to every head: [1, H, MB, NB] / [1, H, MB]
+    q2k_index = (
+        q2k_index_flat.unsqueeze(0).unsqueeze(0).expand(1, num_heads, -1, -1).contiguous()
+    )
+    q2k_num = (
+        q2k_num_flat.unsqueeze(0).unsqueeze(0).expand(1, num_heads, -1).contiguous()
+    )
+
+    return (
+        q2k_index.to(device, non_blocking=non_blocking),
+        q2k_num.to(device, non_blocking=non_blocking),
+    )
+
+
 def convert_bsr_mask_layout(mask: torch.Tensor, indptr: torch.Tensor) -> torch.Tensor:
     r"""Convert mask from BSR data layout to flashinfer's flattened mask layout.
 
@@ -122,9 +167,9 @@ class BlockSparseAttentionWrapper:
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
-            If set to ``auto``, the function will automatically choose the backend based on the
-            device architecture and kernel availability.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``vsa_blackwell``.
+            Defaults to ``auto``.  When set to ``vsa_blackwell`` the VSA Blackwell CUTE-DSL
+            kernel is used; constraints: R==C==64, head_dim==128, num_qo_heads==num_kv_heads.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -157,6 +202,10 @@ class BlockSparseAttentionWrapper:
         self.M: Optional[int] = None
         self.N: Optional[int] = None
         self._backend = backend
+        # VSA Blackwell backend state
+        self._vsa_q2k_index: Optional[torch.Tensor] = None
+        self._vsa_q2k_num: Optional[torch.Tensor] = None
+        self._vsa_variable_block_sizes: Optional[torch.Tensor] = None
 
     def reset_workspace_buffer(
         self,
@@ -292,6 +341,65 @@ class BlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
+
+        # ---- VSA Blackwell backend ------------------------------------------------
+        if self._backend == "vsa_blackwell":
+            if R != 64 or C != 64:
+                raise ValueError(
+                    "VSA Blackwell backend requires R == C == 64 "
+                    f"(got R={R}, C={C})"
+                )
+            if head_dim != 128:
+                raise ValueError(
+                    f"VSA Blackwell backend requires head_dim == 128 (got {head_dim})"
+                )
+            if num_qo_heads != num_kv_heads:
+                raise ValueError(
+                    "VSA Blackwell backend does not support GQA; "
+                    f"num_qo_heads ({num_qo_heads}) must equal num_kv_heads ({num_kv_heads})"
+                )
+            if M % R != 0:
+                raise ValueError(f"M={M} must be divisible by block size R={R}")
+            if N % C != 0:
+                raise ValueError(f"N={N} must be divisible by block size C={C}")
+            if mask is not None or packed_mask is not None:
+                raise ValueError(
+                    "VSA Blackwell backend does not support per-element block masks "
+                    "(mask / packed_mask).  Only block-level sparsity via indptr/indices "
+                    "is supported."
+                )
+            if causal:
+                raise ValueError(
+                    "VSA Blackwell backend does not support causal masking."
+                )
+            if pos_encoding_mode != "NONE":
+                raise ValueError(
+                    f"VSA Blackwell backend only supports pos_encoding_mode='NONE' "
+                    f"(got '{pos_encoding_mode}')."
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                raise ValueError(
+                    "VSA Blackwell backend does not support logits_soft_cap."
+                )
+
+            MB = M // R
+            NB = N // C
+            H = num_qo_heads
+
+            self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
+                indptr, indices, MB, NB, H, self.device, non_blocking
+            )
+            # variable_block_sizes: actual token count per Q-block (uniform = R for all)
+            self._vsa_variable_block_sizes = torch.full(
+                (MB,), R, dtype=torch.int32, device=self.device
+            )
+            self.M = M
+            self.N = N
+            self.R = R
+            self.C = C
+            self._sm_scale = sm_scale
+            return
+        # ---------------------------------------------------------------------------
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -540,6 +648,47 @@ class BlockSparseAttentionWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+
+        # ---- VSA Blackwell backend ------------------------------------------------
+        if self._backend == "vsa_blackwell":
+            from flashinfer.cute_dsl.sparse import (  # noqa: PLC0415
+                dsl_block_sparse_attn_forward,
+            )
+
+            sm_scale = self._sm_scale
+            if sm_scale is None:
+                sm_scale = 1.0 / math.sqrt(q.size(-1))
+
+            # NHD -> BHND  (batch=1, heads=H, seqlen, dim)
+            Q_vsa = q.permute(1, 0, 2).unsqueeze(0).contiguous()
+            K_vsa = k.permute(1, 0, 2).unsqueeze(0).contiguous()
+            V_vsa = v.permute(1, 0, 2).unsqueeze(0).contiguous()
+
+            o_vsa, lse_vsa = dsl_block_sparse_attn_forward(
+                Q_vsa,
+                K_vsa,
+                V_vsa,
+                self._vsa_q2k_index,
+                self._vsa_q2k_num,
+                self._vsa_variable_block_sizes,
+                sm_scale=sm_scale,
+            )
+
+            # BHND -> NHD: [1, H, M, D] -> [M, H, D]
+            output = o_vsa[0].permute(1, 0, 2).contiguous()
+            if out is not None:
+                out.copy_(output)
+                output = out
+
+            if return_lse:
+                # [1, H, M] -> [M, H]
+                lse_out = lse_vsa[0].permute(1, 0).contiguous()
+                if lse is not None:
+                    lse.copy_(lse_out)
+                    lse_out = lse
+                return output, lse_out
+            return output
+        # ---------------------------------------------------------------------------
 
         pos_encoding_mode = self._pos_encoding_mode
         logits_soft_cap = self._logits_soft_cap
