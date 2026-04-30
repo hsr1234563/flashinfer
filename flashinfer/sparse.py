@@ -49,13 +49,13 @@ def _bsr_to_vsa_index(
     device: torch.device,
     non_blocking: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert BSR (indptr/indices) to VSA q2k_index / q2k_num tensors.
+    """Convert head-independent BSR (indptr/indices) to VSA q2k_index / q2k_num tensors.
 
     Returns
     -------
     q2k_index : torch.Tensor  shape ``[1, num_heads, MB, NB]``, dtype int32
-        For each (q_block), the list of attended KV-block indices, padded
-        with -1.  Same pattern is broadcast across all heads.
+        For each q_block, the list of attended KV-block indices, padded with -1.
+        The same pattern is broadcast across all heads.
     q2k_num : torch.Tensor  shape ``[1, num_heads, MB]``, dtype int32
         Number of attended KV-blocks per Q-block.
     """
@@ -82,6 +82,47 @@ def _bsr_to_vsa_index(
     return (
         q2k_index.to(device, non_blocking=non_blocking),
         q2k_num.to(device, non_blocking=non_blocking),
+    )
+
+
+def _block_mask_to_vsa_index(
+    block_mask: torch.Tensor,
+    device: torch.device,
+    non_blocking: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert a per-head boolean block mask to VSA q2k_index / q2k_num tensors.
+
+    Parameters
+    ----------
+    block_mask : torch.Tensor  shape ``[H, MB, NB]``, dtype bool
+        Per-head block-level attention mask.  ``block_mask[h, i, j] = True``
+        means head ``h``'s Q-block ``i`` attends to KV-block ``j``.
+
+    Returns
+    -------
+    q2k_index : torch.Tensor  shape ``[1, H, MB, max_nnz]``, dtype int32
+        Per-head attended KV-block indices, padded with -1.
+    q2k_num : torch.Tensor  shape ``[1, H, MB]``, dtype int32
+        Number of attended KV-blocks per (head, Q-block).
+    """
+    H, MB, NB = block_mask.shape
+    block_mask_cpu = block_mask.cpu()
+
+    q2k_num = block_mask_cpu.sum(dim=-1).to(torch.int32)   # [H, MB]
+    max_nnz = int(q2k_num.max().item())
+    if max_nnz == 0:
+        max_nnz = 1  # avoid zero-size tensor
+
+    # argsort with stable=True puts True (1) entries first along the NB dim
+    sorted_idx = torch.argsort(~block_mask_cpu, dim=-1, stable=True)[:, :, :max_nnz]
+
+    # mask out positions beyond each row's actual count
+    valid = torch.arange(max_nnz).unsqueeze(0).unsqueeze(0) < q2k_num.unsqueeze(-1)
+    q2k_index = torch.where(valid, sorted_idx, torch.full_like(sorted_idx, -1)).to(torch.int32)
+
+    return (
+        q2k_index.unsqueeze(0).to(device, non_blocking=non_blocking),
+        q2k_num.unsqueeze(0).to(device, non_blocking=non_blocking),
     )
 
 def convert_bsr_mask_layout(mask: torch.Tensor, indptr: torch.Tensor) -> torch.Tensor:
@@ -236,8 +277,8 @@ class BlockSparseAttentionWrapper:
     @flashinfer_api
     def plan(
         self,
-        indptr: torch.Tensor,
-        indices: torch.Tensor,
+        indptr: Optional[torch.Tensor],
+        indices: Optional[torch.Tensor],
         M: int,
         N: int,
         R: int,
@@ -258,18 +299,21 @@ class BlockSparseAttentionWrapper:
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Union[str, torch.dtype] = "float16",
         non_blocking: bool = True,
+        block_mask: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
         Parameters
         ----------
-        indptr : torch.Tensor
+        indptr : torch.Tensor, optional
             The block index pointer of the block-sparse matrix on row dimension, shape ``(MB + 1,)``,
             where ``MB`` is the number of blocks in the row dimension.
-        indices: torch.Tensor
+            Required for all backends except ``vsa_blackwell`` when ``block_mask`` is provided.
+        indices: torch.Tensor, optional
             The block indices of the block-sparse matrix on column dimension, shape ``(nnz,)``, where
             ``nnz`` is the number of non-zero blocks. The elements in ``indices`` array should be less then ``NB``:
             the number of blocks in the column dimension.
+            Required for all backends except ``vsa_blackwell`` when ``block_mask`` is provided.
         M : int
             The number of rows of the block-sparse matrix, ``MB = ceil_div(M, R)``.
         N : int
@@ -324,7 +368,11 @@ class BlockSparseAttentionWrapper:
             be inferred by input dtype in quantization
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
-
+        block_mask : torch.Tensor, optional
+            Per-head block-level attention mask, shape ``(num_qo_heads, MB, NB)``, dtype bool.
+            ``block_mask[h, i, j] = True`` means head ``h``'s Q-block ``i`` attends to KV-block ``j``.
+            Only supported for the ``vsa_blackwell`` backend.  When provided, ``indptr``/``indices``
+            are not required and will be ignored.
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
@@ -340,7 +388,7 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
         
-         # ---- VSA Blackwell backend ------------------------------------------------
+        # ---- VSA Blackwell backend ------------------------------------------------
         if self._backend == "vsa_blackwell":
             if R != 64 or C != 64:
                 raise ValueError(
@@ -364,7 +412,7 @@ class BlockSparseAttentionWrapper:
                 raise ValueError(
                     "VSA Blackwell backend does not support per-element block masks "
                     "(mask / packed_mask).  Only block-level sparsity via indptr/indices "
-                    "is supported."
+                    "or block_mask is supported."
                 )
             if causal:
                 raise ValueError(
@@ -384,9 +432,27 @@ class BlockSparseAttentionWrapper:
             NB = N // C
             H = num_qo_heads
 
-            self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
-                indptr, indices, MB, NB, H, self.device, non_blocking
-            )
+            if block_mask is not None:
+                # Per-head path: block_mask [H, MB, NB] bool
+                if block_mask.shape != (H, MB, NB):
+                    raise ValueError(
+                        f"block_mask must have shape (num_qo_heads={H}, MB={MB}, NB={NB}), "
+                        f"got {tuple(block_mask.shape)}"
+                    )
+                self._vsa_q2k_index, self._vsa_q2k_num = _block_mask_to_vsa_index(
+                    block_mask, self.device, non_blocking
+                )
+            else:
+                # Head-independent BSR path
+                if indptr is None or indices is None:
+                    raise ValueError(
+                        "vsa_blackwell backend requires either block_mask or "
+                        "(indptr, indices) to be provided."
+                    )
+                self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
+                    indptr, indices, MB, NB, H, self.device, non_blocking
+                )
+
             # variable_block_sizes: actual token count per Q-block (uniform = R for all)
             self._vsa_variable_block_sizes = torch.full(
                 (MB,), R, dtype=torch.int32, device=self.device
@@ -397,6 +463,13 @@ class BlockSparseAttentionWrapper:
             self.C = C
             self._sm_scale = sm_scale
             return
+
+        if block_mask is not None:
+            raise ValueError(
+                "block_mask is only supported for the vsa_blackwell backend."
+            )
+        if indptr is None or indices is None:
+            raise ValueError("indptr and indices are required for non-vsa_blackwell backends.")
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0

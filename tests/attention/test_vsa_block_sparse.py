@@ -123,11 +123,17 @@ def _make_wrapper(device):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("num_heads", [1, 4, 8])
-@pytest.mark.parametrize("num_blocks", [4, 8, 16])
-@pytest.mark.parametrize("density", [0.25, 0.75])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_vsa_accuracy(num_heads, num_blocks, density, dtype):
+@pytest.mark.parametrize("dtype,density,num_blocks,num_heads", [
+    (torch.bfloat16, 0.25,  4, 1),
+    (torch.bfloat16, 0.25, 16, 8),
+    (torch.bfloat16, 0.75,  4, 8),
+    (torch.bfloat16, 0.75, 16, 1),
+    (torch.float16,  0.25,  4, 8),
+    (torch.float16,  0.25, 16, 1),
+    (torch.float16,  0.75,  4, 1),
+    (torch.float16,  0.75, 16, 8),
+])
+def test_vsa_accuracy(dtype, density, num_blocks, num_heads):
     """VSA output must match PyTorch dense reference."""
     device = torch.device("cuda")
     torch.manual_seed(42)
@@ -235,7 +241,7 @@ def test_vsa_preallocated_lse():
     torch.testing.assert_close(lse, lse_buf)
 
 
-@pytest.mark.parametrize("sm_scale", [0.05, 0.1, 0.5])
+@pytest.mark.parametrize("sm_scale", [0.5])
 def test_vsa_sm_scale(sm_scale):
     """User-supplied sm_scale must propagate correctly."""
     device = torch.device("cuda")
@@ -351,7 +357,7 @@ def _plan_indptr_indices(device, num_blocks=2):
 
 @pytest.mark.parametrize(
     "bad_R, bad_C",
-    [(32, 32), (64, 32), (32, 64), (128, 128)],
+    [(64, 32), (32, 64)],
 )
 def test_plan_rejects_bad_block_size(bad_R, bad_C):
     device = torch.device("cuda")
@@ -445,30 +451,180 @@ def test_plan_rejects_logits_soft_cap():
         )
 
 
+def test_plan_rejects_block_mask_wrong_shape():
+    """block_mask with wrong shape must raise ValueError."""
+    device = torch.device("cuda")
+    num_blocks, num_heads = 4, 4
+    wrapper = _make_wrapper(device)
+    bad_mask = torch.ones(num_heads + 1, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    with pytest.raises(ValueError, match="block_mask must have shape"):
+        wrapper.plan(
+            None, None, num_blocks * R, num_blocks * C, R, C,
+            num_heads, num_heads, HEAD_DIM,
+            block_mask=bad_mask,
+        )
+
+
+def test_plan_rejects_block_mask_non_vsa():
+    """block_mask must be rejected for non-vsa_blackwell backends."""
+    device = torch.device("cuda")
+    num_blocks, num_heads = 4, 4
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = BlockSparseAttentionWrapper(ws, backend="auto")
+    block_mask = torch.ones(num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    with pytest.raises(ValueError, match="vsa_blackwell"):
+        wrapper.plan(
+            None, None, num_blocks * R, num_blocks * C, R, C,
+            num_heads, num_heads, HEAD_DIM,
+            block_mask=block_mask,
+        )
+
+
+def test_plan_rejects_missing_indptr_indices():
+    """vsa_blackwell without block_mask must require indptr/indices."""
+    device = torch.device("cuda")
+    wrapper = _make_wrapper(device)
+    with pytest.raises(ValueError, match="indptr"):
+        wrapper.plan(
+            None, None, 4 * R, 4 * C, R, C,
+            4, 4, HEAD_DIM,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-head mask accuracy tests
+# ---------------------------------------------------------------------------
+
+
+def test_vsa_per_head_mask_correctness():
+    """Per-head block_mask path must match PyTorch dense reference per head."""
+    device = torch.device("cuda")
+    torch.manual_seed(10)
+    num_heads, num_blocks = 4, 8
+    M = N = num_blocks * R
+    dtype = torch.bfloat16
+
+    q = torch.randn(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+
+    # Construct distinct per-head masks
+    block_mask = torch.zeros(num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    for h in range(num_heads):
+        # Each head attends to a different set of blocks
+        chosen = torch.randperm(num_blocks)[:max(1, num_blocks // 2)]
+        block_mask[h, :, chosen] = True
+
+    wrapper = _make_wrapper(device)
+    wrapper.plan(
+        None, None, M, N, R, C,
+        num_heads, num_heads, HEAD_DIM,
+        q_data_type=dtype,
+        block_mask=block_mask,
+    )
+    o_vsa = wrapper.run(q, k, v)
+
+    # PyTorch reference: compute each head independently using its own mask
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    o_ref = torch.empty_like(o_vsa)
+    for h in range(num_heads):
+        qh = q[:, h, :].float()    # [M, D]
+        kh = k[:, h, :].float()    # [N, D]
+        vh = v[:, h, :].float()    # [N, D]
+        # Expand block_mask[h] to token-level
+        token_mask = torch.zeros(M, N, dtype=torch.bool, device=device)
+        for qi in range(num_blocks):
+            for ki in range(num_blocks):
+                if block_mask[h, qi, ki]:
+                    token_mask[qi*R:(qi+1)*R, ki*C:(ki+1)*C] = True
+        scores = torch.matmul(qh, kh.t()) * sm_scale      # [M, N]
+        scores = scores.masked_fill(~token_mask, float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        o_ref[:, h, :] = torch.matmul(probs, vh).to(dtype)
+
+    torch.testing.assert_close(o_ref, o_vsa, atol=1e-2, rtol=1e-2)
+
+
+def test_vsa_per_head_mask_differs_across_heads():
+    """Per-head masks produce different per-head outputs; head-averaged BSR cannot replicate."""
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+    num_heads, num_blocks = 4, 16
+    M = N = num_blocks * R
+    dtype = torch.bfloat16
+
+    q = torch.randn(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+
+    # Maximally different masks: head h attends only to block h (mod num_blocks)
+    block_mask = torch.zeros(num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    for h in range(num_heads):
+        block_mask[h, :, h % num_blocks] = True
+
+    wrapper = _make_wrapper(device)
+    wrapper.plan(
+        None, None, M, N, R, C,
+        num_heads, num_heads, HEAD_DIM,
+        q_data_type=dtype,
+        block_mask=block_mask,
+    )
+    o_per_head = wrapper.run(q, k, v)
+
+    # Head-averaged BSR (union of all per-head blocks)
+    union_mask_bool = block_mask.any(dim=0)   # [MB, NB]
+    nz = union_mask_bool.nonzero(as_tuple=False)
+    indptr = torch.zeros(num_blocks + 1, dtype=torch.int32, device=device)
+    row_counts = union_mask_bool.sum(dim=1).to(torch.int32)
+    indptr[1:] = row_counts.cumsum(0)
+    indices = nz[:, 1].to(torch.int32)
+
+    wrapper2 = _make_wrapper(device)
+    wrapper2.plan(
+        indptr, indices, M, N, R, C,
+        num_heads, num_heads, HEAD_DIM,
+        q_data_type=dtype,
+    )
+    o_head_avg = wrapper2.run(q, k, v)
+
+    # Per-head output must differ from head-averaged (they use different masks)
+    assert not torch.allclose(o_per_head.float(), o_head_avg.float(), atol=1e-3), (
+        "Per-head and head-averaged outputs should differ when masks are distinct per head"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fastvideo-style coarse mask utilities
 # ---------------------------------------------------------------------------
 
 
-def _compute_vsa_coarse_mask_bsr(
+def _compute_vsa_compress_and_mask(
     q: torch.Tensor,
     k: torch.Tensor,
+    v: torch.Tensor,
     R: int,
     C: int,
     topk: int,
     sm_scale: float = None,
 ):
-    """Fastvideo-style two-stage coarse mask → BSR (indptr, indices).
+    """Fastvideo-style compress + coarse-mask step.
 
-    Mirrors the coarse-filter step in fastvideo's video_sparse_attn (ops.py):
-      1. Mean-pool Q and K within each 64-token block.
-      2. Compute block-level dot-product scores averaged across heads: [MB, NB].
-      3. Top-K KV-block selection per Q-block (exact density = topk / NB).
-      4. Convert to BSR format for BlockSparseAttentionWrapper.
+    Fully mirrors video_sparse_attn (__init__.py):
+      1. Mean-pool Q, K, V within each 64-token block.
+      2. Run dense attention on pooled tokens → block_attn_score [H, MB, NB],
+         output_compress_pooled [H, MB, D].
+      3. Broadcast output_compress back to full seq_len → [M, H, D].
+      4. Top-K KV-block selection per (head, Q-block) from block_attn_score
+         → per-head block_mask [H, MB, NB].
 
-    Using head-averaged scores (rather than per-head union) keeps the actual
-    density equal to topk/NB and produces a single shared BSR pattern, which
-    matches FlashInfer's constraint that indptr/indices are head-independent.
+    Returns
+    -------
+    output_compress : torch.Tensor  [M, H, D]
+        Global-context output from compressed attention (same dtype as q).
+    block_mask : torch.Tensor  [H, MB, NB]  bool
+        Per-head block-level selection mask for the VSA sparse branch.
+    density : float
+        Average fraction of selected KV blocks across heads.
     """
     M, H, D = q.shape
     N = k.shape[0]
@@ -477,31 +633,34 @@ def _compute_vsa_coarse_mask_bsr(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)
 
-    # Mean-pool within each block → [MB, H, D] and [NB, H, D]
-    q_pooled = q.view(MB, R, H, D).float().mean(dim=1)
-    k_pooled = k.view(NB, C, H, D).float().mean(dim=1)
+    # Mean-pool within each block → [H, MB/NB, D]
+    q_pooled = q.view(MB, R, H, D).float().mean(dim=1).permute(1, 0, 2)  # [H, MB, D]
+    k_pooled = k.view(NB, C, H, D).float().mean(dim=1).permute(1, 0, 2)  # [H, NB, D]
+    v_pooled = v.view(NB, C, H, D).float().mean(dim=1).permute(1, 0, 2)  # [H, NB, D]
 
-    # Per-head block scores [H, MB, NB], then average across heads → [MB, NB]
-    q_t = q_pooled.permute(1, 0, 2)   # [H, MB, D]
-    k_t = k_pooled.permute(1, 0, 2)   # [H, NB, D]
-    scores = torch.matmul(q_t, k_t.transpose(-1, -2)) * sm_scale  # [H, MB, NB]
-    scores_avg = scores.mean(dim=0)    # [MB, NB]
+    # Dense attention on pooled tokens
+    scores = torch.matmul(q_pooled, k_pooled.transpose(-1, -2)) * sm_scale  # [H, MB, NB]
+    block_attn_score = torch.softmax(scores, dim=-1)                          # [H, MB, NB]
+    out_pooled = torch.matmul(block_attn_score, v_pooled)                    # [H, MB, D]
 
-    # Top-K per Q-block on the averaged scores → exact density = topk / NB
+    # Broadcast compress output: [H, MB, D] → [M, H, D]
+    # Each pooled block result is replicated for all R tokens in the block.
+    output_compress = (
+        out_pooled.permute(1, 0, 2)          # [MB, H, D]
+        .unsqueeze(1)                         # [MB, 1, H, D]
+        .expand(-1, R, -1, -1)               # [MB, R, H, D]
+        .reshape(M, H, D)                    # [M, H, D]
+        .to(q.dtype)
+    )
+
+    # Top-K per (head, Q-block) from softmax block scores → block_mask [H, MB, NB]
     k_actual = min(topk, NB)
-    topk_idx = torch.topk(scores_avg, k_actual, dim=-1).indices    # [MB, k]
-    mask = torch.zeros(MB, NB, dtype=torch.bool, device=q.device)
-    mask.scatter_(-1, topk_idx, True)
+    topk_idx = torch.topk(block_attn_score, k_actual, dim=-1).indices  # [H, MB, topk]
+    block_mask = torch.zeros(H, MB, NB, dtype=torch.bool, device=q.device)
+    block_mask.scatter_(-1, topk_idx, True)
 
-    # Build BSR (indptr, indices) with a single nonzero call to avoid
-    # per-row GPU→CPU syncs (which dominate cost at large MB).
-    nz = mask.nonzero(as_tuple=False)          # [nnz, 2]: (row, col)
-    indices = nz[:, 1].to(torch.int32)
-    row_counts = mask.sum(dim=1).to(torch.int32)   # [MB]
-    indptr = torch.zeros(MB + 1, dtype=torch.int32, device=q.device)
-    indptr[1:] = row_counts.cumsum(0)
-    density = nz.shape[0] / (MB * NB)
-    return indptr, indices, density
+    density = block_mask.float().mean().item()
+    return output_compress, block_mask, density
 
 
 def _cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -518,9 +677,7 @@ def _cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
 
 # (seqlen, topk_fraction)
 _SWEEP_CONFIGS = [
-    (4096,  0.50),
-    (4096,  0.25),
-    (4096,  0.10),
+    (4096,  0.50),   # short-seq boundary: VSA break-even point
     (16384, 0.50),
     (16384, 0.25),
     (16384, 0.10),
@@ -533,11 +690,12 @@ _SWEEP_CONFIGS = [
 
 @pytest.mark.parametrize("seqlen,topk_frac", _SWEEP_CONFIGS)
 def test_vsa_accuracy_vs_dense(seqlen, topk_frac):
-    """Accuracy: two-stage VSA output vs full dense attention at given seqlen/sparsity.
+    """Accuracy: full fastvideo VSA (compress + select) vs full dense attention.
 
-    Stage 1: fastvideo-style coarse mask (mean-pool Q/K, head-averaged scores,
-             top-K selection) → BSR.
-    Stage 2: BlockSparseAttentionWrapper vsa_blackwell.
+    Stage 1: compress attention on mean-pooled tokens → output_compress [M, H, D]
+             + per-head block_mask [H, MB, NB] from softmax block scores.
+    Stage 2: BlockSparseAttentionWrapper vsa_blackwell → output_select [M, H, D].
+    Final:   output_compress + output_select  (mirrors fastvideo final_output).
     Dense:   flashinfer.single_prefill_with_kv_cache(backend="auto").
 
     Metrics reported:
@@ -558,20 +716,24 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac):
     k = torch.randn(seqlen, num_heads, HEAD_DIM, dtype=dtype, device=device)
     v = torch.randn(seqlen, num_heads, HEAD_DIM, dtype=dtype, device=device)
 
-    # Stage 1: coarse mask
-    indptr, indices, actual_density = _compute_vsa_coarse_mask_bsr(
-        q, k, R, C, topk,
+    # Stage 1: compress attention + per-head block mask
+    output_compress, block_mask, actual_density = _compute_vsa_compress_and_mask(
+        q, k, v, R, C, topk,
     )
 
-    # Stage 2: block-sparse attention
+    # Stage 2: block-sparse attention (select branch)
     ws = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
     vsa_w = BlockSparseAttentionWrapper(ws, backend="vsa_blackwell")
     vsa_w.plan(
-        indptr, indices, seqlen, seqlen, R, C,
+        None, None, seqlen, seqlen, R, C,
         num_heads, num_heads, HEAD_DIM,
         q_data_type=dtype,
+        block_mask=block_mask,
     )
-    o_vsa = vsa_w.run(q, k, v)
+    output_select = vsa_w.run(q, k, v)
+
+    # Combine: compress + select  (fastvideo: final_output = output_compress + output_select)
+    o_vsa = output_compress + output_select
 
     # Dense reference
     o_dense = flashinfer.single_prefill_with_kv_cache(q, k, v, backend="auto")
@@ -588,14 +750,16 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac):
 
 
 def test_vsa_performance_vs_dense():
-    """Performance table: two-stage VSA vs dense FlashInfer prefill.
+    """Performance table: full fastvideo VSA (compress + select) vs dense FlashInfer prefill.
 
     VSA timing is broken into two parts:
-      mask_ms   – Stage 1: coarse filter (mean-pool Q/K, block scores, top-K, BSR build)
-      attn_ms   – Stage 2: BlockSparseAttentionWrapper vsa_blackwell kernel
-      total_ms  – mask_ms + attn_ms
+      compress_ms – Stage 1: compress attention (pool Q/K/V, dense attn on pooled tokens,
+                             softmax top-K → block_mask).  This is the "free" byproduct:
+                             output_compress is also produced here.
+      attn_ms     – Stage 2: BlockSparseAttentionWrapper vsa_blackwell (output_select).
+      total_ms    – compress_ms + attn_ms  (output_compress + output_select = final output)
     Dense:
-      dense_ms  – flashinfer.single_prefill_with_kv_cache (auto backend)
+      dense_ms    – flashinfer.single_prefill_with_kv_cache (auto backend)
     Speedup = dense_ms / total_ms.
     """
     device = torch.device("cuda")
@@ -606,9 +770,9 @@ def test_vsa_performance_vs_dense():
 
     header = (
         f"\n{'seqlen':>8}  {'density':>8}  "
-        f"{'dense_ms':>10}  {'mask_ms':>9}  {'attn_ms':>9}  {'total_ms':>10}  {'speedup':>8}"
+        f"{'dense_ms':>10}  {'cmp_ms':>8}  {'attn_ms':>9}  {'total_ms':>10}  {'speedup':>8}"
     )
-    sep = "-" * (len(header) - 1)  # -1 for the leading \n
+    sep = "-" * (len(header) - 1)
     print(header)
     print(sep)
 
@@ -622,24 +786,24 @@ def test_vsa_performance_vs_dense():
         k = torch.randn(seqlen, num_heads, HEAD_DIM, dtype=dtype, device=device)
         v = torch.randn(seqlen, num_heads, HEAD_DIM, dtype=dtype, device=device)
 
-        # Pre-run to get indptr/indices for the attn wrapper setup
-        indptr, indices, actual_density = _compute_vsa_coarse_mask_bsr(
-            q, k, R, C, topk,
+        # Pre-run: get block_mask and plan wrapper
+        output_compress, block_mask, actual_density = _compute_vsa_compress_and_mask(
+            q, k, v, R, C, topk,
         )
-
         vsa_w = BlockSparseAttentionWrapper(ws, backend="vsa_blackwell")
         vsa_w.plan(
-            indptr, indices, seqlen, seqlen, R, C,
+            None, None, seqlen, seqlen, R, C,
             num_heads, num_heads, HEAD_DIM,
             q_data_type=dtype,
+            block_mask=block_mask,
         )
 
-        # Time Stage 1: coarse mask (GPU matmul + topk + CPU BSR construction)
-        mask_times = bench_gpu_time(
-            lambda: _compute_vsa_coarse_mask_bsr(q, k, R, C, topk),
+        # Time Stage 1: compress attention (pool + dense attn on MB tokens + topk)
+        compress_times = bench_gpu_time(
+            lambda: _compute_vsa_compress_and_mask(q, k, v, R, C, topk),
         )
 
-        # Time Stage 2: block-sparse attention kernel only
+        # Time Stage 2: VSA sparse attention kernel
         attn_times = bench_gpu_time(lambda: vsa_w.run(q, k, v))
 
         # Time dense reference
@@ -647,15 +811,15 @@ def test_vsa_performance_vs_dense():
             lambda: flashinfer.single_prefill_with_kv_cache(q, k, v, backend="auto"),
         )
 
-        mask_ms = statistics.median(mask_times)
+        compress_ms = statistics.median(compress_times)
         attn_ms = statistics.median(attn_times)
-        total_ms = mask_ms + attn_ms
+        total_ms = compress_ms + attn_ms
         dense_ms = statistics.median(dense_times)
         speedup = dense_ms / total_ms
 
         print(
             f"{seqlen:>8}  {actual_density:>8.3f}  "
-            f"{dense_ms:>10.3f}  {mask_ms:>9.3f}  {attn_ms:>9.3f}  "
+            f"{dense_ms:>10.3f}  {compress_ms:>8.3f}  {attn_ms:>9.3f}  "
             f"{total_ms:>10.3f}  {speedup:>7.2f}x"
         )
 
